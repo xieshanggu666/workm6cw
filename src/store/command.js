@@ -2,24 +2,21 @@ import { defineStore } from 'pinia'
 import {
   SCENARIOS, RESOURCE_BASES, EVENT_TYPES, RESOURCE_TYPES, SEVERITY, EVENT_STATUS
 } from '@/mock/data'
+import { pathKm } from '@/utils/geo'
 
 // 灾情等级权重（统筹分配优先级：等级高者优先锁定库存）
 const SEV_WEIGHT = { red: 4, orange: 3, yellow: 2, blue: 1 }
 
-// 用高德驾车插件视线估算距离与时长（直线 x 路网系数，演示用）
-export function roughPath(lng1, lat1, lng2, lat2) {
-  const R = 6371
-  const dLat = ((lat2 - lat1) * Math.PI) / 180
-  const dLng = ((lng2 - lng1) * Math.PI) / 180
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) ** 2
-  const dist = 2 * R * Math.asin(Math.sqrt(a))
-  const roadDist = Math.round(dist * 1.25 * 10) / 10 // 路网折算
+// 折线路径估算里程与时长（直线 x 路网系数，演示用）
+export function pathMetrics(points) {
+  const roadDist = Math.round(pathKm(points) * 1.25 * 10) / 10 // 路网折算
   const minutes = Math.round((roadDist / 55) * 60 + 8) // 55km/h 平均 + 装卸
   return { distance: roadDist, minutes }
+}
+
+// 两点直达估算（pathMetrics 的便捷封装）
+export function roughPath(lng1, lat1, lng2, lat2) {
+  return pathMetrics([[lng1, lat1], [lng2, lat2]])
 }
 
 let dpSeq = 0
@@ -55,11 +52,11 @@ export const useCommandStore = defineStore('command', {
       if (state.search) list = list.filter((e) => e.title.includes(state.search) || (e.location && e.location.name.includes(state.search)))
       return list
     },
-    // 各事件在途已满足量：eventId -> { type: qty }（安置点补给记录无 eventId，跳过）
+    // 各事件在途已满足量：eventId -> { type: qty }（安置点补给记录无 eventId、挂起任务未出库，均跳过）
     sentMap(state) {
       const m = {}
       state.dispatches.forEach((d) => {
-        if (!d.eventId) return
+        if (!d.eventId || d.status === 'held') return
         m[d.eventId] = m[d.eventId] || {}
         m[d.eventId][d.type] = (m[d.eventId][d.type] || 0) + d.qty
       })
@@ -155,7 +152,9 @@ export const useCommandStore = defineStore('command', {
         lng: ev.location.lng, lat: ev.location.lat,
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
-        color: EVENT_TYPES[ev.type].color, source
+        color: EVENT_TYPES[ev.type].color, source,
+        // 道路阻断处置：在途/挂起状态、绕行途经点、来源阻断
+        status: 'enroute', via: [], detourBy: null, holdBy: null
       }
       this.dispatches.unshift(record)
       ev.timeline.push({ at: record.at, text: `${source}派发 ${record.typeLabel} ${qty}${record.unit}👈${base.name}` })
@@ -184,16 +183,102 @@ export const useCommandStore = defineStore('command', {
         lng, lat,
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
-        color: '#26a69a', source: '安置补给'
+        color: '#26a69a', source: '安置补给',
+        status: 'enroute', via: [], detourBy: null, holdBy: null
       }
       this.dispatches.unshift(record)
       return record
     },
+    /* ---------- 道路阻断处置：改道 / 改派 / 挂起 / 续派 ---------- */
+    // 绕行改道：写入途经点并重算里程与到达时间（地图路线联动更新）
+    rerouteDispatch(id, via, blockId = null) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec || rec.status === 'held') return null
+      const base = this.bases.find((b) => b.id === rec.baseId)
+      if (!base) return null
+      const m = pathMetrics([[base.lng, base.lat], ...via, [rec.lng, rec.lat]])
+      rec.via = via
+      rec.distance = m.distance
+      rec.minutes = m.minutes
+      rec.detourBy = blockId
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `🔀 派发绕行改道：${rec.typeLabel} ${rec.qty}${rec.unit}，约 ${m.distance}km·${m.minutes}min` })
+      return rec
+    },
+    // 改派出货基地：退回旧基地库存、新基地扣减，路线与 ETA 重算
+    reassignDispatch(id, newBaseId) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      const nb = this.bases.find((b) => b.id === newBaseId)
+      if (!rec || !nb || rec.status === 'held' || rec.baseId === newBaseId) return null
+      if ((nb.stock[rec.type] || 0) < rec.qty) return null
+      const ob = this.bases.find((b) => b.id === rec.baseId)
+      if (ob) ob.stock[rec.type] = (ob.stock[rec.type] || 0) + rec.qty
+      nb.stock[rec.type] -= rec.qty
+      rec.baseId = nb.id
+      rec.baseName = nb.name
+      rec.via = []
+      rec.detourBy = null
+      const m = pathMetrics([[nb.lng, nb.lat], [rec.lng, rec.lat]])
+      rec.distance = m.distance
+      rec.minutes = m.minutes
+      rec.source = '改派'
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `🔀 派发改派：${rec.typeLabel} ${rec.qty}${rec.unit} 改由 ${nb.name} 出库` })
+      return rec
+    },
+    // 挂起：物资退回基地、不计入已满足量，待恢复通行后续派
+    holdDispatch(id, blockId) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec || rec.status === 'held') return null
+      const base = this.bases.find((b) => b.id === rec.baseId)
+      if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + rec.qty
+      rec.status = 'held'
+      rec.holdBy = blockId
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `⏸ 派发挂起：${rec.typeLabel} ${rec.qty}${rec.unit} 因道路阻断退回 ${rec.baseName}，待恢复通行后续派` })
+      return rec
+    },
+    // 续派：复核库存后重新出库，重置路线与出发时间
+    resumeDispatch(id) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec || rec.status !== 'held') return { ok: false, msg: '记录不存在或未挂起' }
+      const base = this.bases.find((b) => b.id === rec.baseId)
+      if (!base || (base.stock[rec.type] || 0) < rec.qty) {
+        return { ok: false, msg: `${base?.name || rec.baseName} 库存不足，无法续派` }
+      }
+      base.stock[rec.type] -= rec.qty
+      rec.status = 'enroute'
+      rec.holdBy = null
+      rec.via = []
+      rec.detourBy = null
+      const m = pathMetrics([[base.lng, base.lat], [rec.lng, rec.lat]])
+      rec.distance = m.distance
+      rec.minutes = m.minutes
+      rec.at = nowStr()
+      const ev = this.events.find((e) => e.id === rec.eventId)
+      if (ev) ev.timeline.push({ at: nowStr(), text: `▶️ 恢复续派：${rec.typeLabel} ${rec.qty}${rec.unit} 重新出库，约 ${m.distance}km·${m.minutes}min` })
+      return { ok: true }
+    },
+    // 阻断解除后恢复直线（由道路阻断模块判定不再穿越其它阻断后调用）
+    resetDispatchRoute(id) {
+      const rec = this.dispatches.find((d) => d.id === id)
+      if (!rec || rec.status === 'held') return
+      const base = this.bases.find((b) => b.id === rec.baseId)
+      if (!base) return
+      rec.via = []
+      rec.detourBy = null
+      const m = pathMetrics([[base.lng, base.lat], [rec.lng, rec.lat]])
+      rec.distance = m.distance
+      rec.minutes = m.minutes
+    },
     withdrawDispatch(recordId) {
       const rec = this.dispatches.find((d) => d.id === recordId)
       if (!rec) return
-      const base = this.bases.find((b) => b.id === rec.baseId)
-      if (base) base.stock[rec.type] += rec.qty
+      // 挂起记录库存已退回，撤回时不再重复返还
+      if (rec.status !== 'held') {
+        const base = this.bases.find((b) => b.id === rec.baseId)
+        if (base) base.stock[rec.type] += rec.qty
+      }
       this.dispatches = this.dispatches.filter((d) => d.id !== recordId)
     },
 
@@ -335,11 +420,13 @@ export const useCommandStore = defineStore('command', {
     resetResource(eventId) {
       const ev = this.events.find((e) => e.id === eventId)
       if (!ev) return
-      // 撤回该事件关联的所有派发
+      // 撤回该事件关联的所有派发（挂起记录库存已退回，不再重复返还）
       this.dispatches = this.dispatches.filter((d) => {
         if (d.eventId !== eventId) return true
-        const base = this.bases.find((b) => b.id === d.baseId)
-        if (base) base.stock[d.type] += d.qty
+        if (d.status !== 'held') {
+          const base = this.bases.find((b) => b.id === d.baseId)
+          if (base) base.stock[d.type] += d.qty
+        }
         return false
       })
     }

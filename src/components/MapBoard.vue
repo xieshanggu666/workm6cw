@@ -19,6 +19,12 @@
       <div class="legend-item"><i class="dot" style="background:#4caf50"></i>Ⅳ级·一般</div>
       <div class="legend-item"><i class="dot" style="background:#2962ff"></i>资源库/救援点</div>
       <div class="legend-item"><i class="dot" style="background:#26a69a"></i>安置点/转移路线</div>
+      <div class="legend-item"><i class="dot" style="background:#c62828"></i>道路阻断区</div>
+    </div>
+
+    <!-- 圈画提示 -->
+    <div v-if="roadblock.drawing" class="draw-tip">
+      🖱️ 圈画封闭范围：已 {{ roadblock.draft.length }} 点（右键/双击完成）
     </div>
 
     <!-- 事件选中浮层（右下角信息卡） -->
@@ -41,11 +47,13 @@
 import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore } from '@/store/roadblock'
 import { loadAMap } from '@/config/amap'
 import { EVENT_TYPES, SEVERITY, RESOURCE_TYPES } from '@/mock/data'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const roadblock = useRoadblockStore()
 const mapRef = ref(null)
 const loading = ref(true)
 const loadError = ref('')
@@ -53,7 +61,10 @@ const loadError = ref('')
 let map = null
 let amap = null
 let heatmap = null
-let overlays = { poly: [], markers: [], lines: [], baseMarkers: [], shelterMarkers: [], transferLines: [] }
+let overlays = {
+  poly: [], markers: [], lines: [], baseMarkers: [], shelterMarkers: [], transferLines: [],
+  blocks: [], blockMarkers: [], draft: []
+}
 
 const selectedEvent = computed(() =>
   store.events.find((e) => e.id === store.selectedEventId) || null
@@ -179,21 +190,22 @@ function renderHeatmap() {
   }
 }
 
-// 渲染派发路径线（资源库 → 受灾点）
+// 渲染派发路径线（资源库 → 受灾点，含绕行途经点；挂起任务置灰）
 function renderDispatches() {
   clearLines()
   store.dispatches.forEach((d) => {
     const base = store.bases.find((b) => b.id === d.baseId)
     if (!base) return
+    const held = d.status === 'held'
     const line = new amap.Polyline({
-      path: [[base.lng, base.lat], [d.lng, d.lat]],
-      strokeColor: d.color,
-      strokeOpacity: 0.85,
+      path: [[base.lng, base.lat], ...(d.via || []), [d.lng, d.lat]],
+      strokeColor: held ? '#5b6f94' : d.color,
+      strokeOpacity: held ? 0.45 : 0.85,
       strokeWeight: 4,
       lineJoin: 'round',
       lineCap: 'round',
       strokeStyle: 'dashed',
-      showDir: true
+      showDir: !held
     })
     map.add(line)
     overlays.lines.push(line)
@@ -230,7 +242,7 @@ function renderShelters() {
   })
 }
 
-// 转移路线（受灾点 → 安置点，未办结批次）
+// 转移路线（受灾点 → 安置点，未办结批次；含绕行途经点，挂起批次置灰）
 function renderTransfers() {
   overlays.transferLines.forEach((l) => map?.remove(l))
   overlays.transferLines = []
@@ -241,18 +253,106 @@ function renderTransfers() {
     const sh = transfer.shelters.find((s) => s.id === b.shelterId)
     if (!ev || !sh) return
     const line = new amap.Polyline({
-      path: [[ev.location.lng, ev.location.lat], [sh.lng, sh.lat]],
-      strokeColor: '#26a69a',
-      strokeOpacity: 0.8,
+      path: [[ev.location.lng, ev.location.lat], ...(b.via || []), [sh.lng, sh.lat]],
+      strokeColor: b.held ? '#5b6f94' : '#26a69a',
+      strokeOpacity: b.held ? 0.45 : 0.8,
       strokeWeight: 3,
       lineJoin: 'round',
       lineCap: 'round',
       strokeStyle: 'dashed',
-      showDir: true
+      showDir: !b.held
     })
     map.add(line)
     overlays.transferLines.push(line)
   })
+}
+
+// 道路阻断区（红色封闭范围 + 🚧 标记；已恢复置灰）
+function renderBlocks() {
+  overlays.blocks.forEach((p) => map?.remove(p))
+  overlays.blockMarkers.forEach((m) => map?.remove(m))
+  overlays.blocks = []
+  overlays.blockMarkers = []
+  if (!amap || !map) return
+  roadblock.blocks.forEach((blk) => {
+    const active = blk.status === 'active'
+    const poly = new amap.Polygon({
+      path: blk.polygon,
+      fillColor: active ? '#c62828' : '#9e9e9e',
+      fillOpacity: active ? 0.22 : 0.08,
+      strokeColor: active ? '#ef5350' : '#9e9e9e',
+      strokeWeight: 2,
+      strokeOpacity: 0.9,
+      strokeStyle: active ? 'solid' : 'dashed',
+      bubble: true
+    })
+    poly.on('click', () => { roadblock.selectedBlockId = blk.id })
+    map.add(poly)
+    overlays.blocks.push(poly)
+    blk._poly = poly
+    const cx = blk.polygon.reduce((s, p) => s + p[0], 0) / blk.polygon.length
+    const cy = blk.polygon.reduce((s, p) => s + p[1], 0) / blk.polygon.length
+    const marker = new amap.Marker({
+      position: [cx, cy],
+      content: `<div class="blk-marker ${active ? '' : 'cleared'}" title="${blk.name}">🚧</div>`,
+      anchor: 'center',
+      cursor: 'pointer'
+    })
+    marker.on('click', () => { roadblock.selectedBlockId = blk.id })
+    map.add(marker)
+    overlays.blockMarkers.push(marker)
+  })
+}
+
+// 圈画中的草稿（顶点 + 闭合虚线预览）
+function renderDraft() {
+  overlays.draft.forEach((o) => map?.remove(o))
+  overlays.draft = []
+  if (!amap || !map || !roadblock.draft.length) return
+  const path = roadblock.draft.length > 2 ? [...roadblock.draft, roadblock.draft[0]] : roadblock.draft
+  const line = new amap.Polyline({
+    path,
+    strokeColor: '#ef5350',
+    strokeWeight: 2,
+    strokeOpacity: 0.9,
+    strokeStyle: 'dashed',
+    lineJoin: 'round'
+  })
+  map.add(line)
+  overlays.draft.push(line)
+  roadblock.draft.forEach((pt) => {
+    const m = new amap.Marker({
+      position: pt,
+      content: '<div class="draft-dot"></div>',
+      anchor: 'center'
+    })
+    map.add(m)
+    overlays.draft.push(m)
+  })
+}
+
+// 圈画模式：地图事件挂载/卸载
+function onDrawClick(e) {
+  roadblock.addDraftPoint(e.lnglat.lng, e.lnglat.lat)
+}
+function onDrawFinish() {
+  roadblock.finishDrawing()
+}
+function bindDrawing(on) {
+  if (!map) return
+  if (on) {
+    map.setDefaultCursor('crosshair')
+    map.setStatus({ doubleClickZoom: false })
+    map.on('click', onDrawClick)
+    map.on('rightclick', onDrawFinish)
+    map.on('dblclick', onDrawFinish)
+  } else {
+    map.setDefaultCursor('default')
+    map.setStatus({ doubleClickZoom: true })
+    map.off('click', onDrawClick)
+    map.off('rightclick', onDrawFinish)
+    map.off('dblclick', onDrawFinish)
+  }
 }
 
 onMounted(async () => {
@@ -274,6 +374,7 @@ onMounted(async () => {
     renderHeatmap()
     renderShelters()
     renderTransfers()
+    renderBlocks()
     loading.value = false
     map.setFitView(null, false, [100, 80, 120, 80], 1)
   } catch (e) {
@@ -285,12 +386,16 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   store.stopAutoPlay()
+  bindDrawing(false)
   overlays.markers.forEach((m) => map?.remove(m))
   overlays.poly.forEach((p) => map?.remove(p))
   overlays.lines.forEach((l) => map?.remove(l))
   overlays.baseMarkers.forEach((m) => map?.remove(m))
   overlays.shelterMarkers.forEach((m) => map?.remove(m))
   overlays.transferLines.forEach((l) => map?.remove(l))
+  overlays.blocks.forEach((p) => map?.remove(p))
+  overlays.blockMarkers.forEach((m) => map?.remove(m))
+  overlays.draft.forEach((o) => map?.remove(o))
   map?.destroy()
 })
 
@@ -300,19 +405,35 @@ watch(() => store.selectedEventId, (id) => {
   const ev = store.events.find((e) => e.id === id)
   if (ev && map) map.setFitView([], false, [100, 80, 120, 80])
 })
-watch(() => store.dispatches.length, () => renderDispatches())
+// 派发记录：增删、挂起/续派、绕行/改派均触发路线重绘
+watch(
+  () => store.dispatches.map((d) => d.id + d.status + d.baseId + (d.via?.length || 0)).join(','),
+  () => renderDispatches()
+)
 watch(() => store.filteredEvents.map((e) => e.affected).join(','), () => {
   if (amap) renderHeatmap()
 })
 // 转移安置：批次变化 → 重绘转移路线；登记人数变化 → 刷新安置点角标
 watch(
-  () => transfer.batches.map((b) => b.id + b.status + b.shelterId).join(',') + store.scenarioId,
+  () => transfer.batches.map((b) => b.id + b.status + b.shelterId + (b.held ? 1 : 0) + (b.via?.length || 0)).join(',') + store.scenarioId,
   () => { renderTransfers(); renderShelters() }
 )
 watch(
   () => transfer.batches.reduce((sum, b) => sum + b.members.filter((x) => x.checkinAt && !x.checkoutAt).length, 0),
   () => renderShelters()
 )
+// 道路阻断：阻断区增删/状态变化 → 重绘；圈画草稿 → 预览；圈画模式 → 绑定地图事件
+watch(
+  () => roadblock.blocks.map((b) => b.id + b.status).join(','),
+  () => renderBlocks()
+)
+watch(() => roadblock.draft.length, () => renderDraft())
+watch(() => roadblock.drawing, (on) => bindDrawing(on))
+// 选中阻断 → 地图聚焦该封闭区
+watch(() => roadblock.selectedBlockId, (id) => {
+  const blk = roadblock.blocks.find((b) => b.id === id)
+  if (blk?._poly && map) map.setFitView([blk._poly], false, [120, 100, 120, 100])
+})
 
 // 展平 dispatch 里带坐标的辅助（供模板使用）
 </script>
@@ -395,6 +516,18 @@ watch(
 .pop-sev { font-size: 12px; flex-shrink: 0; }
 .pop-desc { color: #aebadd; font-size: 12px; line-height: 1.6; margin: 8px 0; }
 .pop-meta { display: flex; gap: 12px; font-size: 12px; color: #8ea1c4; }
+
+/* 圈画提示 */
+.draw-tip {
+  position: absolute;
+  top: 14px; left: 50%; transform: translateX(-50%);
+  background: rgba(183,28,28,0.92); color: #fff;
+  border: 1px solid rgba(255,255,255,0.35);
+  border-radius: 8px; padding: 8px 16px;
+  font-size: 12px; z-index: 4;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+  backdrop-filter: blur(4px);
+}
 </style>
 
 <style>
@@ -453,5 +586,23 @@ watch(
 .shelter-marker em {
   font-style: normal; font-size: 9px; color: #a7f3d0; font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+/* 道路阻断标记与圈画草稿点 */
+.blk-marker {
+  width: 30px; height: 30px; border-radius: 50%;
+  background: #b71c1c; border: 2.5px solid #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px; cursor: pointer;
+  animation: blkPulse 1.8s ease-out infinite;
+}
+.blk-marker.cleared { background: #616161; animation: none; opacity: 0.75; }
+@keyframes blkPulse {
+  0% { box-shadow: 0 0 0 0 rgba(239,83,80,0.55); }
+  100% { box-shadow: 0 0 0 14px rgba(239,83,80,0); }
+}
+.draft-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #ef5350; border: 2px solid #fff;
+  box-shadow: 0 1px 5px rgba(0,0,0,0.5);
 }
 </style>

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { useCommandStore, roughPath } from '@/store/command'
+import { useCommandStore, roughPath, pathMetrics } from '@/store/command'
 import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
 
 let batchSeq = 0
@@ -101,6 +101,53 @@ export const useTransferStore = defineStore('transfer', {
     },
     _batch(id) { return this.batches.find((b) => b.id === id) },
 
+    /* ---------- 道路阻断处置：挂起 / 绕行 / 续派 ---------- */
+
+    // 重算批次路线 ETA（受灾点 → 途经点 → 安置点）
+    _syncEta(b) {
+      const ev = this._event(b.eventId)
+      const sh = this.shelters.find((s) => s.id === b.shelterId)
+      if (!ev || !sh) return
+      const pts = [[ev.location.lng, ev.location.lat], ...(b.via || []), [sh.lng, sh.lat]]
+      b.eta = pathMetrics(pts)
+    },
+    // 挂起：车辆与床位预占保留，接运/入住登记暂停，恢复通行后续派
+    holdBatch(batchId, blockId) {
+      const b = this._batch(batchId)
+      if (!b || b.status === 'closed' || b.held) return
+      b.held = true
+      b.holdBy = blockId
+      this._log(b.eventId, `⏸ 批次「${b.name}」因道路阻断挂起（车辆/床位预占保留，待续派）`)
+    },
+    // 续派：解除挂起并恢复直线 ETA
+    resumeBatch(batchId) {
+      const b = this._batch(batchId)
+      if (!b || !b.held) return
+      b.held = false
+      b.holdBy = null
+      b.via = []
+      b.detourBy = null
+      this._syncEta(b)
+      this._log(b.eventId, `▶️ 批次「${b.name}」恢复通行续派，预计 ${b.eta?.minutes}min 抵达安置点`)
+    },
+    // 绕行改道：写入途经点并重算 ETA（地图转移路线联动更新）
+    rerouteBatch(batchId, via, blockId = null) {
+      const b = this._batch(batchId)
+      if (!b || b.status === 'closed') return
+      b.via = via
+      b.detourBy = blockId
+      this._syncEta(b)
+      this._log(b.eventId, `🔀 批次「${b.name}」绕行改道，约 ${b.eta?.distance}km·${b.eta?.minutes}min`)
+    },
+    // 阻断解除后恢复直线（由道路阻断模块判定后调用）
+    resetBatchRoute(batchId) {
+      const b = this._batch(batchId)
+      if (!b) return
+      b.via = []
+      b.detourBy = null
+      this._syncEta(b)
+    },
+
     /* ---------- 批次生命周期 ---------- */
 
     // 指挥员建批：分配车辆（占用资源库车辆库存）与安置点（预占床位）
@@ -130,8 +177,11 @@ export const useTransferStore = defineStore('transfer', {
         vehicleReleased: false,
         status: 'pending',
         members: [],
-        createdAt: nowStr()
+        createdAt: nowStr(),
+        // 道路阻断处置：挂起状态、绕行途经点与预计到达
+        held: false, holdBy: null, via: [], detourBy: null, eta: null
       }
+      this._syncEta(batch)
       this.batches.unshift(batch)
       // 回写事件：时间线 + 状态联动
       this._log(eventId, `🚌 创建转移批次「${batch.name}」：计划 ${headcount} 人，${base.name} 出车 ${vehicleCount} 辆 → ${shelter.name}`)
@@ -155,6 +205,9 @@ export const useTransferStore = defineStore('transfer', {
         }
         changes.push(`安置点改派：${this.shelters.find((s) => s.id === b.shelterId)?.name} → ${target.name}`)
         b.shelterId = shelterId
+        b.via = [] // 安置点变更后路线重算
+        b.detourBy = null
+        this._syncEta(b)
       }
       // 调整车辆：先释放旧占用，再占用新配置
       if (vehicleBaseId && vehicleCount != null) {
@@ -215,6 +268,10 @@ export const useTransferStore = defineStore('transfer', {
       const b = this._batch(batchId)
       if (!b) return { ok: false, msg: '批次不存在' }
       if (b.status === 'closed') return { ok: false, msg: '批次已办结' }
+      // 道路阻断挂起中：接运/入住暂停（转出不受影响，在住群众可正常疏解）
+      if (b.held && stage !== 'checkout') {
+        return { ok: false, msg: '批次因道路阻断挂起中，待恢复通行续派后再登记' }
+      }
       if (payload.count != null) return this._registerBulk(b, stage, payload.count)
       const name = (payload.name || '').trim()
       const idNo = (payload.idNo || '').trim()

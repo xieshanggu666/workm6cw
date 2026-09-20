@@ -40,6 +40,10 @@
         <span class="num" style="color:#ffc107">{{ store.stats.dispatchedToday }}</span>
         <span class="lab">今日派发</span>
       </div>
+      <div class="stat" :class="{ blocked: roadblock.activeBlocks.length }">
+        <span class="num" style="color:#ef5350">{{ roadblock.activeBlocks.length }}</span>
+        <span class="lab">道路阻断</span>
+      </div>
       <div class="stat">
         <span class="num" style="color:#4fc3f7">{{ transfer.stats.inTransit }}</span>
         <span class="lab">在途转移</span>
@@ -72,10 +76,12 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore } from '@/store/roadblock'
 import { SCENARIOS } from '@/mock/data'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const roadblock = useRoadblockStore()
 const scenarios = SCENARIOS
 const now = ref('')
 let timer = null
@@ -132,6 +138,7 @@ onBeforeUnmount(() => clearInterval(timer))
 .stat .num { display: block; font-size: 20px; font-weight: 800; line-height: 1.1; }
 .stat .lab { font-size: 10px; color: #8ba2c8; }
 .stat.affected { border-color: rgba(255,112,67,0.5); background: rgba(60,24,14,0.4); }
+.stat.blocked { border-color: rgba(239,83,80,0.55); background: rgba(60,14,14,0.4); }
 
 .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .clock {

@@ -1,6 +1,6 @@
 <template>
   <div class="dispatch">
-    <!-- 页签：单点派发 / 统筹方案 / 转移安置 -->
+    <!-- 页签：单点派发 / 统筹方案 / 转移安置 / 道路阻断 -->
     <div class="tabs">
       <button :class="{ active: tab === 'single' }" @click="tab = 'single'">🎯 单点派发</button>
       <button :class="{ active: tab === 'plan' }" @click="tab = 'plan'">
@@ -8,6 +8,9 @@
       </button>
       <button :class="{ active: tab === 'transfer' }" @click="tab = 'transfer'">
         🚌 转移安置<span v-if="transfer.stats.activeBatches" class="badge teal">{{ transfer.stats.activeBatches }}</span>
+      </button>
+      <button :class="{ active: tab === 'road' }" @click="tab = 'road'">
+        🚧 道路阻断<span v-if="roadblock.activeBlocks.length" class="badge red">{{ roadblock.activeBlocks.length }}</span>
       </button>
     </div>
 
@@ -73,14 +76,16 @@
     <div class="dispatches">
       <div class="panel-sub">🚚 在途派发记录</div>
       <div v-if="store.dispatches.length === 0" class="tiny-empty">暂无派发</div>
-      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item">
+      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item" :class="{ held: d.status === 'held' }">
         <div class="di-head">
           <span class="di-dot" :style="{ background: d.color }"></span>
           <strong>{{ d.typeLabel }}</strong>
+          <span v-if="d.status === 'held'" class="di-held">⏸ 挂起</span>
+          <span v-else-if="d.via && d.via.length" class="di-detour">🔀 绕行</span>
           <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹' }">{{ d.source }}</span>
           <span class="di-qty">{{ d.qty }}{{ d.unit }}</span>
         </div>
-        <p class="di-sub">{{ d.baseName }} → {{ d.eventTitle }}</p>
+        <p class="di-sub">{{ d.baseName }} → {{ d.eventTitle || d.shelterName }}</p>
         <p class="di-meta">{{ d.at }} · {{ d.distance }}km · 约{{ d.minutes }}min</p>
         <button class="undo" @click="store.withdrawDispatch(d.id)">撤回</button>
       </div>
@@ -91,7 +96,10 @@
     <PlanPanel v-else-if="tab === 'plan'" />
 
     <!-- 群众转移安置 -->
-    <TransferPanel v-else />
+    <TransferPanel v-else-if="tab === 'transfer'" />
+
+    <!-- 道路阻断处置 -->
+    <RoadBlockPanel v-else />
   </div>
 </template>
 
@@ -99,12 +107,15 @@
 import { ref, computed, watch } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore } from '@/store/roadblock'
 import { RESOURCE_TYPES } from '@/mock/data'
 import PlanPanel from '@/components/PlanPanel.vue'
 import TransferPanel from '@/components/TransferPanel.vue'
+import RoadBlockPanel from '@/components/RoadBlockPanel.vue'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const roadblock = useRoadblockStore()
 const tab = ref('single')
 const form = ref({ baseId: '', type: 'personnel', qty: 0 })
 
@@ -191,6 +202,7 @@ watch(selectedEvent, (ev) => {
   border-radius: 8px; vertical-align: 1px;
 }
 .badge.teal { background: #26a69a; }
+.badge.red { background: #ef5350; }
 .panel-sub {
   font-size: 12px; color: #6f8cb8; font-weight: 600;
   border-left: 3px solid #4d8dff; padding-left: 8px; margin: 6px 0;
@@ -257,6 +269,7 @@ watch(selectedEvent, (ev) => {
   background: rgba(16,29,57,0.6); border: 1px solid rgba(120,160,220,0.12);
   border-radius: 9px; padding: 9px 40px 9px 10px;
 }
+.dispatch-item.held { border-color: rgba(255,193,7,0.35); opacity: 0.75; }
 .di-head { display: flex; align-items: center; gap: 7px; }
 .di-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .di-head strong { color: #dbe4f3; font-size: 12px; }
@@ -265,6 +278,14 @@ watch(selectedEvent, (ev) => {
   background: rgba(120,160,220,0.15); color: #8ba2c8;
 }
 .di-src.plan { background: rgba(156,77,255,0.2); color: #ce93ff; }
+.di-held {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(255,193,7,0.18); color: #ffd54f;
+}
+.di-detour {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(255,152,0,0.15); color: #ffcc80;
+}
 .di-qty { margin-left: auto; color: #ffc107; font-size: 12px; font-weight: 700; }
 .di-sub { font-size: 10px; color: #8ba2c8; margin: 4px 0 0; }
 .di-meta { font-size: 10px; color: #5b6f94; margin: 2px 0 0; }

@@ -69,10 +69,11 @@
 
         <!-- 批次卡片 -->
         <div v-if="!eventBatches.length && !creating" class="tiny-empty">该事件暂无转移批次</div>
-        <div v-for="b in eventBatches" :key="b.id" class="batch-card" :class="{ closed: b.status === 'closed' }">
+        <div v-for="b in eventBatches" :key="b.id" class="batch-card" :class="{ closed: b.status === 'closed', held: b.held }">
           <div class="bc-head">
             <span class="bc-status" :style="{ background: statusColor(b.status) }">{{ statusLabel(b.status) }}</span>
             <strong>{{ b.name }}</strong>
+            <span v-if="b.held" class="bc-held">⏸ 阻断挂起</span>
             <span class="bc-time">{{ b.createdAt }}</span>
           </div>
           <div class="bc-progress">
@@ -90,9 +91,13 @@
           <p class="bc-meta">
             🚒 {{ baseName(b.vehicleBaseId) }} · {{ b.vehicleCount }}辆{{ b.vehicleReleased ? '（已回收）' : '' }}
             <br />🏕️ {{ shelterName(b.shelterId) }}
+            <template v-if="b.eta">
+              <br />🚚 约 {{ b.eta.distance }}km · {{ b.eta.minutes }}min{{ b.via && b.via.length ? '（绕行中）' : '' }}
+            </template>
           </p>
+          <p v-if="b.held" class="bc-held-hint">道路阻断挂起中：接运/入住登记暂停，恢复通行后可在「道路阻断」页签续派</p>
           <div class="bc-actions" v-if="b.status !== 'closed'">
-            <button @click="toggle(b.id, 'reg')">📝 登记</button>
+            <button :disabled="b.held" @click="toggle(b.id, 'reg')">📝 登记</button>
             <button @click="toggle(b.id, 're')">🔀 改派</button>
             <button class="ok" @click="onClose(b)">✅ 办结</button>
             <button v-if="!b.members.length" class="danger" @click="onCancel(b)">🗑 取消</button>
@@ -431,6 +436,12 @@ function onSupply(shelterId) {
   border-radius: 9px; padding: 9px 10px;
 }
 .batch-card.closed { opacity: 0.62; }
+.batch-card.held { border-color: rgba(255,193,7,0.4); }
+.bc-held {
+  font-size: 9px; padding: 1px 6px; border-radius: 4px; flex-shrink: 0;
+  background: rgba(255,193,7,0.18); color: #ffd54f;
+}
+.bc-held-hint { font-size: 10px; color: #ffd54f; margin: 6px 0 0; }
 .bc-head { display: flex; align-items: center; gap: 7px; }
 .bc-status { color: #fff; font-size: 10px; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
 .bc-head strong {
@@ -452,6 +463,8 @@ function onSupply(shelterId) {
   color: #8ba2c8; font-size: 11px; border-radius: 6px; cursor: pointer;
 }
 .bc-actions button:hover { color: #fff; border-color: #4d8dff; }
+.bc-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+.bc-actions button:disabled:hover { color: #8ba2c8; border-color: rgba(120,160,220,0.2); }
 .bc-actions .ok:hover { color: #7ef0c9; border-color: #26a69a; }
 .bc-actions .danger:hover { color: #ef5350; border-color: #ef5350; }
 
