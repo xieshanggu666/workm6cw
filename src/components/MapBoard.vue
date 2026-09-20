@@ -19,6 +19,15 @@
       <div class="legend-item"><i class="dot" style="background:#4caf50"></i>Ⅳ级·一般</div>
       <div class="legend-item"><i class="dot" style="background:#2962ff"></i>资源库/救援点</div>
       <div class="legend-item"><i class="dot" style="background:#26a69a"></i>安置点/转移路线</div>
+      <div class="legend-item"><i class="dot" style="background:#ef5350"></i>道路阻断（红待确认/橙封路）</div>
+      <div class="legend-item"><i class="dot" style="background:#ffc107"></i>绕行/改派路线</div>
+    </div>
+
+    <!-- 勾绘提示条 -->
+    <div v-if="rbStore.drawing" class="draw-tip">
+      🚧 正在勾绘封闭范围：依次点击地图加点
+      <button @click="finishDraw">✅ 完成</button>
+      <button @click="cancelDraw">取消</button>
     </div>
 
     <!-- 事件选中浮层（右下角信息卡） -->
@@ -41,11 +50,13 @@
 import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore, BLOCKAGE_STATUS } from '@/store/roadblock'
 import { loadAMap } from '@/config/amap'
-import { EVENT_TYPES, SEVERITY, RESOURCE_TYPES } from '@/mock/data'
+import { EVENT_TYPES, SEVERITY } from '@/mock/data'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const rbStore = useRoadblockStore()
 const mapRef = ref(null)
 const loading = ref(true)
 const loadError = ref('')
@@ -53,7 +64,10 @@ const loadError = ref('')
 let map = null
 let amap = null
 let heatmap = null
-let overlays = { poly: [], markers: [], lines: [], baseMarkers: [], shelterMarkers: [], transferLines: [] }
+let overlays = {
+  poly: [], markers: [], lines: [], baseMarkers: [], shelterMarkers: [], transferLines: [],
+  blockageShapes: [], draftShapes: []
+}
 
 const selectedEvent = computed(() =>
   store.events.find((e) => e.id === store.selectedEventId) || null
@@ -179,24 +193,41 @@ function renderHeatmap() {
   }
 }
 
-// 渲染派发路径线（资源库 → 受灾点）
+// 渲染派发路径线（资源库 → 受灾点/安置点；阻断后按绕行点/挂起状态着色）
 function renderDispatches() {
   clearLines()
   store.dispatches.forEach((d) => {
     const base = store.bases.find((b) => b.id === d.baseId)
     if (!base) return
+    const path = (d.routePoints && d.routePoints.length >= 2)
+      ? d.routePoints.map((p) => [p[0], p[1]])
+      : [[base.lng, base.lat], [d.lng, d.lat]]
+    const suspended = d.routeStatus === 'suspended'
+    const rerouted = d.routeStatus === 'rerouted'
     const line = new amap.Polyline({
-      path: [[base.lng, base.lat], [d.lng, d.lat]],
-      strokeColor: d.color,
-      strokeOpacity: 0.85,
+      path,
+      strokeColor: suspended ? '#7e8aa2' : (rerouted ? '#ffc107' : d.color),
+      strokeOpacity: suspended ? 0.7 : 0.9,
       strokeWeight: 4,
       lineJoin: 'round',
       lineCap: 'round',
-      strokeStyle: 'dashed',
-      showDir: true
+      strokeStyle: suspended ? 'solid' : 'dashed',
+      showDir: !suspended
     })
     map.add(line)
     overlays.lines.push(line)
+    // 绕行途经点
+    if (rerouted && d.routePoints && d.routePoints.length > 2) {
+      d.routePoints.slice(1, -1).forEach((p) => {
+        const wp = new amap.CircleMarker({
+          center: [p[0], p[1]], radius: 6,
+          strokeColor: '#fff', strokeWeight: 1.5,
+          fillColor: '#ffc107', fillOpacity: 0.95
+        })
+        map.add(wp)
+        overlays.lines.push(wp)
+      })
+    }
   })
 }
 
@@ -230,7 +261,7 @@ function renderShelters() {
   })
 }
 
-// 转移路线（受灾点 → 安置点，未办结批次）
+// 转移路线（受灾点 → 安置点，未办结批次；阻断后按改派/挂起着色）
 function renderTransfers() {
   overlays.transferLines.forEach((l) => map?.remove(l))
   overlays.transferLines = []
@@ -240,19 +271,113 @@ function renderTransfers() {
     const ev = store.events.find((e) => e.id === b.eventId)
     const sh = transfer.shelters.find((s) => s.id === b.shelterId)
     if (!ev || !sh) return
+    const path = (b.routeWaypoints && b.routeWaypoints.length >= 2)
+      ? b.routeWaypoints.map((p) => [p[0], p[1]])
+      : [[ev.location.lng, ev.location.lat], [sh.lng, sh.lat]]
+    const suspended = b.routeStatus === 'suspended'
+    const rerouted = b.routeStatus === 'rerouted'
     const line = new amap.Polyline({
-      path: [[ev.location.lng, ev.location.lat], [sh.lng, sh.lat]],
-      strokeColor: '#26a69a',
-      strokeOpacity: 0.8,
+      path,
+      strokeColor: suspended ? '#7e8aa2' : (rerouted ? '#ffc107' : '#26a69a'),
+      strokeOpacity: 0.85,
       strokeWeight: 3,
       lineJoin: 'round',
       lineCap: 'round',
-      strokeStyle: 'dashed',
-      showDir: true
+      strokeStyle: suspended ? 'solid' : 'dashed',
+      showDir: !suspended
     })
     map.add(line)
     overlays.transferLines.push(line)
   })
+}
+
+/* ---------- 道路阻断：封闭带渲染 + 地图勾绘 ---------- */
+
+function blockageColor(status) {
+  return BLOCKAGE_STATUS.find((x) => x.value === status)?.color || '#ef5350'
+}
+
+// 阻断路段：折线 + 缓冲带圆圈 + 阻断点 Marker
+function renderBlockages() {
+  overlays.blockageShapes.forEach((o) => map?.remove(o))
+  overlays.blockageShapes = []
+  if (!amap || !map) return
+  rbStore.blockages.forEach((rb) => {
+    const color = blockageColor(rb.status)
+    const faded = rb.status === 'cleared' || rb.status === 'dismissed'
+    const line = new amap.Polyline({
+      path: rb.path.map((p) => [p[0], p[1]]),
+      strokeColor: color,
+      strokeOpacity: faded ? 0.3 : 0.95,
+      strokeWeight: 5,
+      lineJoin: 'round',
+      lineCap: 'round',
+      showDir: false
+    })
+    map.add(line)
+    overlays.blockageShapes.push(line)
+    rb.path.forEach((p) => {
+      const c = new amap.Circle({
+        center: [p[0], p[1]],
+        radius: rb.radius,
+        strokeColor: color,
+        strokeOpacity: faded ? 0.15 : 0.5,
+        strokeWeight: 1,
+        fillColor: color,
+        fillOpacity: faded ? 0.05 : 0.18
+      })
+      map.add(c)
+      overlays.blockageShapes.push(c)
+    })
+    const mid = rb.path[Math.floor(rb.path.length / 2)]
+    const marker = new amap.Marker({
+      position: [mid[0], mid[1]],
+      content: `<div class="rb-marker" style="--rc:${color}"><span>${faded ? '🟢' : '🚧'}</span></div>`,
+      anchor: 'center',
+      cursor: 'pointer'
+    })
+    marker.on('click', () => { if (rb.eventId) store.selectEvent(rb.eventId) })
+    map.add(marker)
+    overlays.blockageShapes.push(marker)
+  })
+}
+
+// 勾绘草稿：已点的折线 + 顶点
+function renderDraft() {
+  overlays.draftShapes.forEach((o) => map?.remove(o))
+  overlays.draftShapes = []
+  if (!amap || !map) return
+  const pts = rbStore.draftPath
+  if (!pts.length) return
+  const line = new amap.Polyline({
+    path: pts.map((p) => [p[0], p[1]]),
+    strokeColor: '#ff9800', strokeOpacity: 0.9, strokeWeight: 4,
+    lineJoin: 'round', lineCap: 'round'
+  })
+  map.add(line)
+  overlays.draftShapes.push(line)
+  pts.forEach((p, i) => {
+    const dot = new amap.CircleMarker({
+      center: [p[0], p[1]], radius: 5,
+      strokeColor: '#fff', strokeWeight: 1.5,
+      fillColor: i === pts.length - 1 ? '#ff9800' : '#ef5350', fillOpacity: 0.95
+    })
+    map.add(dot)
+    overlays.draftShapes.push(dot)
+  })
+}
+
+function onMapClick(e) {
+  if (!rbStore.drawing) return
+  const p = e.lnglat
+  rbStore.draftPath = [...rbStore.draftPath, [p.lng, p.lat]]
+}
+function finishDraw() {
+  rbStore.drawing = false
+}
+function cancelDraw() {
+  rbStore.drawing = false
+  rbStore.draftPath = []
 }
 
 onMounted(async () => {
@@ -270,10 +395,13 @@ onMounted(async () => {
     const toolbar = new amap.ToolBar({ position: 'RT' })
     map.addControl(scale)
     map.addControl(toolbar)
+    map.on('click', onMapClick)
     renderEvents()
     renderHeatmap()
     renderShelters()
     renderTransfers()
+    renderBlockages()
+    renderDraft()
     loading.value = false
     map.setFitView(null, false, [100, 80, 120, 80], 1)
   } catch (e) {
@@ -285,12 +413,15 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   store.stopAutoPlay()
+  map?.off('click', onMapClick)
   overlays.markers.forEach((m) => map?.remove(m))
   overlays.poly.forEach((p) => map?.remove(p))
   overlays.lines.forEach((l) => map?.remove(l))
   overlays.baseMarkers.forEach((m) => map?.remove(m))
   overlays.shelterMarkers.forEach((m) => map?.remove(m))
   overlays.transferLines.forEach((l) => map?.remove(l))
+  overlays.blockageShapes.forEach((o) => map?.remove(o))
+  overlays.draftShapes.forEach((o) => map?.remove(o))
   map?.destroy()
 })
 
@@ -301,18 +432,42 @@ watch(() => store.selectedEventId, (id) => {
   if (ev && map) map.setFitView([], false, [100, 80, 120, 80])
 })
 watch(() => store.dispatches.length, () => renderDispatches())
+// 派发路线被阻断处置（绕行点/改派基地/挂起）后重绘
+watch(
+  () => store.dispatches.map((d) => d.id + d.routeStatus + (d.baseId) + (d.routePoints?.length || 0)).join(','),
+  () => renderDispatches()
+)
 watch(() => store.filteredEvents.map((e) => e.affected).join(','), () => {
   if (amap) renderHeatmap()
 })
 // 转移安置：批次变化 → 重绘转移路线；登记人数变化 → 刷新安置点角标
 watch(
-  () => transfer.batches.map((b) => b.id + b.status + b.shelterId).join(',') + store.scenarioId,
+  () => transfer.batches.map((b) => b.id + b.status + b.shelterId + (b.routeStatus || '')).join(',') + store.scenarioId,
   () => { renderTransfers(); renderShelters() }
 )
 watch(
   () => transfer.batches.reduce((sum, b) => sum + b.members.filter((x) => x.checkinAt && !x.checkoutAt).length, 0),
   () => renderShelters()
 )
+
+// 道路阻断：记录变化重绘；勾绘草稿变化重绘；定位请求飞向阻断中点
+watch(
+  () => rbStore.blockages.map((x) => x.id + x.status).join(','),
+  () => renderBlockages()
+)
+watch(
+  () => rbStore.draftPath.map((p) => p.join(',')).join('|') + (rbStore.drawing ? 'd' : ''),
+  () => renderDraft()
+)
+watch(() => rbStore.focusBlockageId, (id) => {
+  if (!id || !map || !amap) return
+  const target = rbStore.blockages.find((x) => x.id === id)
+  if (!target) return
+  const bounds = new amap.Bounds()
+  target.path.forEach((p) => bounds.extend(new amap.LngLat(p[0], p[1])))
+  map.setBounds(bounds, false, [80, 80, 80, 80])
+  rbStore.focusBlockageId = null
+})
 
 // 展平 dispatch 里带坐标的辅助（供模板使用）
 </script>
@@ -373,6 +528,22 @@ watch(
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
 
 /* 事件弹出卡 */
+.draw-tip {
+  position: absolute;
+  top: 14px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(60, 24, 14, 0.92);
+  border: 1px solid rgba(255, 112, 67, 0.55);
+  border-radius: 8px; padding: 8px 14px;
+  z-index: 4; color: #ffccbc; font-size: 12px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+}
+.draw-tip button {
+  background: transparent; border: 1px solid rgba(255,112,67,0.6);
+  color: #ffab91; font-size: 11px; border-radius: 5px; padding: 3px 9px; cursor: pointer;
+}
+.draw-tip button:hover { background: rgba(255,112,67,0.18); color: #fff; }
+
 .event-pop {
   position: absolute;
   right: 14px; bottom: 40px;
@@ -453,5 +624,14 @@ watch(
 .shelter-marker em {
   font-style: normal; font-size: 9px; color: #a7f3d0; font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+.rb-marker {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  background: var(--rc);
+  display: flex; align-items: center; justify-content: center;
+  border: 2.5px solid #fff;
+  box-shadow: 0 3px 8px rgba(0,0,0,0.5);
+  font-size: 13px;
 }
 </style>

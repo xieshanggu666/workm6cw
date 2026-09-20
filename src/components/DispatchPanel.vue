@@ -9,6 +9,11 @@
       <button :class="{ active: tab === 'transfer' }" @click="tab = 'transfer'">
         🚌 转移安置<span v-if="transfer.stats.activeBatches" class="badge teal">{{ transfer.stats.activeBatches }}</span>
       </button>
+      <button :class="{ active: tab === 'roadblock' }" @click="tab = 'roadblock'">
+        🚧 道路阻断<span v-if="rbStore.openBlockages.length || rbStore.suspendedCount" class="badge orange">
+          {{ rbStore.openBlockages.length + rbStore.suspendedCount }}
+        </span>
+      </button>
     </div>
 
     <template v-if="tab === 'single'">
@@ -73,15 +78,16 @@
     <div class="dispatches">
       <div class="panel-sub">🚚 在途派发记录</div>
       <div v-if="store.dispatches.length === 0" class="tiny-empty">暂无派发</div>
-      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item">
+      <div v-for="d in store.dispatches" :key="d.id" class="dispatch-item" :class="{ suspended: d.routeStatus === 'suspended' }">
         <div class="di-head">
           <span class="di-dot" :style="{ background: d.color }"></span>
           <strong>{{ d.typeLabel }}</strong>
           <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹' }">{{ d.source }}</span>
+          <span v-if="routeTag(d)" class="di-route" :style="{ color: routeTag(d).color, borderColor: routeTag(d).color }">{{ routeTag(d).label }}</span>
           <span class="di-qty">{{ d.qty }}{{ d.unit }}</span>
         </div>
         <p class="di-sub">{{ d.baseName }} → {{ d.eventTitle }}</p>
-        <p class="di-meta">{{ d.at }} · {{ d.distance }}km · 约{{ d.minutes }}min</p>
+        <p class="di-meta">{{ d.at }} · {{ d.distance }}km · 约{{ d.minutes }}min<span v-if="d.routeStatus !== 'normal'"> · 更新于 {{ d.routeAt }}</span></p>
         <button class="undo" @click="store.withdrawDispatch(d.id)">撤回</button>
       </div>
     </div>
@@ -89,6 +95,9 @@
 
     <!-- 多灾点统筹方案 -->
     <PlanPanel v-else-if="tab === 'plan'" />
+
+    <!-- 道路阻断处置 -->
+    <RoadblockPanel v-else-if="tab === 'roadblock'" />
 
     <!-- 群众转移安置 -->
     <TransferPanel v-else />
@@ -99,12 +108,15 @@
 import { ref, computed, watch } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore } from '@/store/roadblock'
 import { RESOURCE_TYPES } from '@/mock/data'
 import PlanPanel from '@/components/PlanPanel.vue'
 import TransferPanel from '@/components/TransferPanel.vue'
+import RoadblockPanel from '@/components/RoadblockPanel.vue'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const rbStore = useRoadblockStore()
 const tab = ref('single')
 const form = ref({ baseId: '', type: 'personnel', qty: 0 })
 
@@ -151,6 +163,15 @@ function onDispatch() {
   if (rec) form.value.qty = 0
 }
 
+// 道路阻断联动状态标签
+function routeTag(d) {
+  if (d.routeStatus === 'suspended') return { label: '已挂起', color: '#ff7043' }
+  if (d.routeStatus === 'rerouted') {
+    return { label: d.actionType === 'detour' ? '已绕行' : '已改派', color: '#ffc107' }
+  }
+  return null
+}
+
 watch(() => store.scenarioId, () => {
   form.value = { baseId: '', type: 'personnel', qty: 0 }
 })
@@ -191,6 +212,7 @@ watch(selectedEvent, (ev) => {
   border-radius: 8px; vertical-align: 1px;
 }
 .badge.teal { background: #26a69a; }
+.badge.orange { background: #ff7043; }
 .panel-sub {
   font-size: 12px; color: #6f8cb8; font-weight: 600;
   border-left: 3px solid #4d8dff; padding-left: 8px; margin: 6px 0;
@@ -265,6 +287,11 @@ watch(selectedEvent, (ev) => {
   background: rgba(120,160,220,0.15); color: #8ba2c8;
 }
 .di-src.plan { background: rgba(156,77,255,0.2); color: #ce93ff; }
+.di-route {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px;
+  border: 1px solid; background: transparent;
+}
+.dispatch-item.suspended { border-color: rgba(255,112,67,0.45); background: rgba(60,24,14,0.28); }
 .di-qty { margin-left: auto; color: #ffc107; font-size: 12px; font-weight: 700; }
 .di-sub { font-size: 10px; color: #8ba2c8; margin: 4px 0 0; }
 .di-meta { font-size: 10px; color: #5b6f94; margin: 2px 0 0; }

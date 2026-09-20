@@ -91,6 +91,8 @@
             🚒 {{ baseName(b.vehicleBaseId) }} · {{ b.vehicleCount }}辆{{ b.vehicleReleased ? '（已回收）' : '' }}
             <br />🏕️ {{ shelterName(b.shelterId) }}
           </p>
+          <p v-if="b.routeStatus === 'suspended'" class="bc-suspend">⏸️ 道路阻断挂起中 · {{ b.suspendedAt || '' }}（车辆床位保留，恢复通行自动续派）</p>
+          <p v-else-if="b.routeStatus === 'rerouted'" class="bc-rerouted">🔀 道路阻断改派 → {{ shelterName(b.shelterId) }}</p>
           <div class="bc-actions" v-if="b.status !== 'closed'">
             <button @click="toggle(b.id, 'reg')">📝 登记</button>
             <button @click="toggle(b.id, 're')">🔀 改派</button>
@@ -446,6 +448,16 @@ function onSupply(shelterId) {
 .seg-in { background: rgba(142,68,173,0.75); }
 .seg-out { background: #4caf50; }
 .bc-meta { font-size: 10px; color: #8ba2c8; margin: 7px 0 0; line-height: 1.6; }
+.bc-suspend {
+  font-size: 10px; color: #ffab91; margin: 6px 0 0;
+  background: rgba(255,112,67,0.1); border: 1px solid rgba(255,112,67,0.35);
+  border-radius: 5px; padding: 4px 7px;
+}
+.bc-rerouted {
+  font-size: 10px; color: #ffc107; margin: 6px 0 0;
+  background: rgba(255,193,7,0.08); border: 1px solid rgba(255,193,7,0.3);
+  border-radius: 5px; padding: 4px 7px;
+}
 .bc-actions { display: flex; gap: 6px; margin-top: 8px; }
 .bc-actions button {
   flex: 1; padding: 5px 0; background: #0c1730; border: 1px solid rgba(120,160,220,0.2);

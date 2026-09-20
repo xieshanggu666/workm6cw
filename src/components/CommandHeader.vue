@@ -48,6 +48,10 @@
         <span class="num" style="color:#7ef0c9">{{ transfer.stats.housed }}</span>
         <span class="lab">安置中</span>
       </div>
+      <div class="stat suspended">
+        <span class="num" style="color:#ff7043">{{ roadblock.suspendedCount }}</span>
+        <span class="lab">阻断挂起</span>
+      </div>
       <div class="stat affected">
         <span class="num" style="color:#ff7043">{{ store.stats.totalAffected.toLocaleString() }}</span>
         <span class="lab">受影响群众</span>
@@ -72,10 +76,12 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useCommandStore } from '@/store/command'
 import { useTransferStore } from '@/store/transfer'
+import { useRoadblockStore } from '@/store/roadblock'
 import { SCENARIOS } from '@/mock/data'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
+const roadblock = useRoadblockStore()
 const scenarios = SCENARIOS
 const now = ref('')
 let timer = null
@@ -132,6 +138,7 @@ onBeforeUnmount(() => clearInterval(timer))
 .stat .num { display: block; font-size: 20px; font-weight: 800; line-height: 1.1; }
 .stat .lab { font-size: 10px; color: #8ba2c8; }
 .stat.affected { border-color: rgba(255,112,67,0.5); background: rgba(60,24,14,0.4); }
+.stat.suspended { border-color: rgba(255,112,67,0.45); background: rgba(60,24,14,0.35); }
 
 .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .clock {

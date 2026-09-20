@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia'
 import { useCommandStore, roughPath } from '@/store/command'
+import { useRoadblockStore } from '@/store/roadblock'
+import { routeHitAny } from '@/utils/geo'
 import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
 
 let batchSeq = 0
@@ -101,6 +103,19 @@ export const useTransferStore = defineStore('transfer', {
     },
     _batch(id) { return this.batches.find((b) => b.id === id) },
 
+    // 新建批次时路线正撞上已确认封路：自动挂起（车辆已占用、床位已预占，恢复后续派）
+    _checkNewBatchBlocked(batch) {
+      const rbStore = useRoadblockStore()
+      const actives = rbStore.activeBlockages
+      if (!actives.length) return
+      const ev = this._event(batch.eventId)
+      const sh = this.shelters.find((s) => s.id === batch.shelterId)
+      if (!ev || !sh) return
+      if (routeHitAny([[ev.location.lng, ev.location.lat], [sh.lng, sh.lat]], actives)) {
+        rbStore._suspendBatch(batch, actives.map((x) => x.id))
+      }
+    },
+
     /* ---------- 批次生命周期 ---------- */
 
     // 指挥员建批：分配车辆（占用资源库车辆库存）与安置点（预占床位）
@@ -130,12 +145,17 @@ export const useTransferStore = defineStore('transfer', {
         vehicleReleased: false,
         status: 'pending',
         members: [],
-        createdAt: nowStr()
+        createdAt: nowStr(),
+        // 道路阻断联动：normal 正常 / rerouted 已改线（改派安置点）/ suspended 已挂起
+        routeStatus: 'normal', actionType: null, routeWaypoints: null,
+        blockedBy: null, suspendBy: null, suspendSnapshot: null,
+        originalRoute: null, originalShelterId: null, routeAt: null
       }
       this.batches.unshift(batch)
       // 回写事件：时间线 + 状态联动
       this._log(eventId, `🚌 创建转移批次「${batch.name}」：计划 ${headcount} 人，${base.name} 出车 ${vehicleCount} 辆 → ${shelter.name}`)
       if (ev.status === 'reported' || ev.status === 'assessing') ev.status = 'dispatching'
+      this._checkNewBatchBlocked(batch)
       return { ok: true, batch }
     },
 
@@ -144,6 +164,7 @@ export const useTransferStore = defineStore('transfer', {
       const cmd = this._cmd()
       const b = this._batch(batchId)
       if (!b || b.status === 'closed') return { ok: false, msg: '批次不存在或已办结' }
+      if (b.routeStatus === 'suspended') return { ok: false, msg: '道路阻断挂起中，请在「道路阻断」页签处置' }
       const changes = []
       // 换安置点：已有入住登记后不允许（人员已落床位）
       if (shelterId && shelterId !== b.shelterId) {
@@ -201,6 +222,7 @@ export const useTransferStore = defineStore('transfer', {
     cancelBatch(batchId) {
       const b = this._batch(batchId)
       if (!b) return { ok: false, msg: '批次不存在' }
+      if (b.routeStatus === 'suspended') return { ok: false, msg: '道路阻断挂起中，不能取消，请等待恢复通行或改派' }
       if (b.members.length > 0) return { ok: false, msg: '已有登记记录，不能取消，请走办结流程' }
       this._releaseVehicles(b)
       this.batches = this.batches.filter((x) => x.id !== batchId)
@@ -215,6 +237,9 @@ export const useTransferStore = defineStore('transfer', {
       const b = this._batch(batchId)
       if (!b) return { ok: false, msg: '批次不存在' }
       if (b.status === 'closed') return { ok: false, msg: '批次已办结' }
+      if (b.routeStatus === 'suspended') {
+        return { ok: false, msg: '道路阻断，批次已挂起，恢复通行续派后再登记' }
+      }
       if (payload.count != null) return this._registerBulk(b, stage, payload.count)
       const name = (payload.name || '').trim()
       const idNo = (payload.idNo || '').trim()
@@ -318,6 +343,7 @@ export const useTransferStore = defineStore('transfer', {
       const b = this._batch(batchId)
       const m = b?.members.find((x) => x.id === memberId)
       if (!b || !m || b.status === 'closed') return { ok: false, msg: '不可操作' }
+      if (b.routeStatus === 'suspended') return { ok: false, msg: '批次因道路阻断挂起中，暂不可登记' }
       if (!m.checkinAt) return this._checkin(b, [m])
       if (!m.checkoutAt) return this._checkout(b, [m])
       return { ok: false, msg: '该人员已转出' }

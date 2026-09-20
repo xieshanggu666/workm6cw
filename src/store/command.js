@@ -2,6 +2,8 @@ import { defineStore } from 'pinia'
 import {
   SCENARIOS, RESOURCE_BASES, EVENT_TYPES, RESOURCE_TYPES, SEVERITY, EVENT_STATUS
 } from '@/mock/data'
+import { useRoadblockStore } from '@/store/roadblock'
+import { routeHitAny } from '@/utils/geo'
 
 // 灾情等级权重（统筹分配优先级：等级高者优先锁定库存）
 const SEV_WEIGHT = { red: 4, orange: 3, yellow: 2, blue: 1 }
@@ -155,12 +157,28 @@ export const useCommandStore = defineStore('command', {
         lng: ev.location.lng, lat: ev.location.lat,
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
-        color: EVENT_TYPES[ev.type].color, source
+        color: EVENT_TYPES[ev.type].color, source,
+        // 道路阻断联动：normal 正常 / rerouted 已改线 / suspended 已挂起
+        routeStatus: 'normal', actionType: null, routePoints: null,
+        blockedBy: null, suspendBy: null, suspendSnapshot: null,
+        originalRoute: null, originalBaseId: null, routeAt: null
       }
       this.dispatches.unshift(record)
       ev.timeline.push({ at: record.at, text: `${source}派发 ${record.typeLabel} ${qty}${record.unit}👈${base.name}` })
       if (ev.status === 'assessing' || ev.status === 'reported') ev.status = 'dispatching'
+      this._checkNewDispatchBlocked(record)
       return record
+    },
+    // 新建派发时若正撞上已确认封路：自动挂起，等待恢复通行续派
+    _checkNewDispatchBlocked(record) {
+      const rbStore = useRoadblockStore()
+      const actives = rbStore.activeBlockages
+      if (!actives.length) return
+      const base = this.bases.find((b) => b.id === record.baseId)
+      if (!base) return
+      if (routeHitAny([[base.lng, base.lat], [record.lng, record.lat]], actives)) {
+        rbStore._suspendDispatch(record, actives.map((x) => x.id))
+      }
     },
     // 从资源库派发资源到受灾点
     dispatchResource({ baseId, eventId, type, qty }) {
@@ -184,9 +202,13 @@ export const useCommandStore = defineStore('command', {
         lng, lat,
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
-        color: '#26a69a', source: '安置补给'
+        color: '#26a69a', source: '安置补给',
+        routeStatus: 'normal', actionType: null, routePoints: null,
+        blockedBy: null, suspendBy: null, suspendSnapshot: null,
+        originalRoute: null, originalBaseId: null, routeAt: null
       }
       this.dispatches.unshift(record)
+      this._checkNewDispatchBlocked(record)
       return record
     },
     withdrawDispatch(recordId) {
